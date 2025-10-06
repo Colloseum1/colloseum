@@ -43,4 +43,79 @@ impl Policy {
         8 + 8 + 8 + 8 + // notional limits
         4 + 8 + // compute limits
         100; // padding
+
+    /// Check if program is allowed
+    pub fn is_program_allowed(&self, program_id: &Pubkey) -> bool {
+        self.allowed_programs.contains(program_id)
+    }
+
+    /// Check if mint is allowed
+    pub fn is_mint_allowed(&self, mint: &Pubkey) -> Result<()> {
+        // Fail if explicitly denied
+        require!(
+            !self.denied_mints.contains(mint),
+            crate::errors::VaultError::MintDenied
+        );
+        
+        // Pass if allowlist is empty (allow all) or mint is in allowlist
+        if self.allowed_mints.is_empty() || self.allowed_mints.contains(mint) {
+            Ok(())
+        } else {
+            Err(crate::errors::VaultError::MintNotAllowed.into())
+        }
+    }
+
+    /// Check and update daily notional cap
+    pub fn check_and_update_daily_cap(
+        &mut self,
+        amount_usd_cents: u64,
+    ) -> Result<()> {
+        // Roll over to new day if needed
+        let clock = Clock::get()?;
+        let current_day = clock.unix_timestamp / 86_400;
+
+        if current_day != self.day_epoch {
+            self.day_epoch = current_day;
+            self.spent_today_usd_cents = 0;
+        }
+
+        // Check per-order cap
+        require!(
+            amount_usd_cents <= self.per_order_notional_usd_cents,
+            crate::errors::VaultError::PerOrderCapExceeded
+        );
+
+        // Check daily cap
+        let new_spent = self.spent_today_usd_cents
+            .checked_add(amount_usd_cents)
+            .ok_or(crate::errors::VaultError::DailyCapExceeded)?;
+
+        require!(
+            new_spent <= self.daily_notional_usd_cents,
+            crate::errors::VaultError::DailyCapExceeded
+        );
+
+        // Update spent amount
+        self.spent_today_usd_cents = new_spent;
+        Ok(())
+    }
+
+    /// Validate compute limits
+    pub fn validate_compute_limits(
+        &self,
+        compute_units: u32,
+        priority_fee: u64,
+    ) -> Result<()> {
+        require!(
+            compute_units <= self.max_compute_units,
+            crate::errors::VaultError::ComputeUnitExceeded
+        );
+
+        require!(
+            priority_fee <= self.max_priority_fee_lamports,
+            crate::errors::VaultError::PriorityFeeExceeded
+        );
+
+        Ok(())
+    }
 }

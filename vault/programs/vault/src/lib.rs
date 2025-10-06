@@ -80,7 +80,22 @@ pub mod vault {
         ctx: Context<Deposit>,
         amount: u64,
     ) -> Result<()> {
-        // Transfer tokens from user to vault
+        let policy = &ctx.accounts.policy;
+
+        // 1. Check if policy is paused
+        require!(!policy.paused, VaultError::Paused);
+
+        // 2. Validate mint is allowed
+        policy.is_mint_allowed(&ctx.accounts.user_token_account.mint)?;
+
+        // 3. Ensure deposit is to the correct vault token account
+        require_keys_eq!(
+            ctx.accounts.user_token_account.mint,
+            ctx.accounts.vault.base_mint,
+            VaultError::MintNotAllowed
+        );
+
+        // 4. Transfer tokens from user to vault
         token::transfer(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
@@ -101,6 +116,134 @@ pub mod vault {
         });
 
         msg!("Deposited {} tokens", amount);
+        Ok(())
+    }
+
+    pub fn withdraw(
+        ctx: Context<Withdraw>,
+        amount: u64,
+    ) -> Result<()> {
+        let vault = &ctx.accounts.vault;
+        let policy = &ctx.accounts.policy;
+
+        // 1. Check if policy is paused
+        require!(!policy.paused, VaultError::Paused);
+
+        // 2. Verify the user is the admin (or authorized user)
+        require_keys_eq!(
+            ctx.accounts.user.key(),
+            vault.admin,
+            VaultError::Unauthorized
+        );
+
+        // 3. Check vault has sufficient balance
+        let vault_balance = ctx.accounts.vault_token_account.amount;
+        require!(
+            vault_balance >= amount,
+            VaultError::InsufficientBalance
+        );
+
+        // 4. Transfer tokens from vault to user using PDA signature
+        let admin_key = vault.admin;
+        let seeds = &[
+            b"vault",
+            admin_key.as_ref(),
+            &[vault.bump],
+        ];
+        let signer_seeds = &[&seeds[..]];
+
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                Transfer {
+                    from: ctx.accounts.vault_token_account.to_account_info(),
+                    to: ctx.accounts.user_token_account.to_account_info(),
+                    authority: ctx.accounts.vault.to_account_info(),
+                },
+                signer_seeds,
+            ),
+            amount,
+        )?;
+
+        // 5. Emit withdrawal event
+        emit!(WithdrawEvent {
+            vault: vault.key(),
+            user: ctx.accounts.user.key(),
+            amount,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+
+        msg!("Withdrew {} tokens", amount);
+        Ok(())
+    }
+
+    pub fn update_policy_allowlists(
+        ctx: Context<UpdatePolicy>,
+        allowed_programs: Option<Vec<Pubkey>>,
+        allowed_mints: Option<Vec<Pubkey>>,
+        denied_mints: Option<Vec<Pubkey>>,
+    ) -> Result<()> {
+        let policy = &mut ctx.accounts.policy;
+
+        if let Some(programs) = allowed_programs {
+            require!(
+                programs.len() <= Policy::MAX_ALLOWED_PROGRAMS,
+                VaultError::ProgramNotAllowed
+            );
+            policy.allowed_programs = programs;
+        }
+
+        if let Some(mints) = allowed_mints {
+            require!(
+                mints.len() <= Policy::MAX_ALLOWED_MINTS,
+                VaultError::MintNotAllowed
+            );
+            policy.allowed_mints = mints;
+        }
+
+        if let Some(denied) = denied_mints {
+            require!(
+                denied.len() <= Policy::MAX_DENIED_MINTS,
+                VaultError::MintDenied
+            );
+            policy.denied_mints = denied;
+        }
+
+        msg!("Policy allowlists updated");
+        Ok(())
+    }
+
+    pub fn update_policy_risk_params(
+        ctx: Context<UpdatePolicy>,
+        max_slippage_bps: Option<u16>,
+        max_oracle_delta_bps: Option<u16>,
+        max_oracle_age_slots: Option<u64>,
+        max_confidence_bps: Option<u32>,
+    ) -> Result<()> {
+        let policy = &mut ctx.accounts.policy;
+
+        if let Some(slippage) = max_slippage_bps {
+            policy.max_slippage_bps = slippage;
+        }
+        if let Some(delta) = max_oracle_delta_bps {
+            policy.max_oracle_delta_bps = delta;
+        }
+        if let Some(age) = max_oracle_age_slots {
+            policy.max_oracle_age_slots = age;
+        }
+        if let Some(conf) = max_confidence_bps {
+            policy.max_confidence_bps = conf;
+        }
+
+        msg!("Policy risk parameters updated");
+        Ok(())
+    }
+
+    pub fn toggle_pause(ctx: Context<UpdatePolicy>) -> Result<()> {
+        let policy = &mut ctx.accounts.policy;
+        policy.paused = !policy.paused;
+        
+        msg!("Policy paused status: {}", policy.paused);
         Ok(())
     }
 }
@@ -177,23 +320,71 @@ pub struct InitializeRegistry<'info> {
 pub struct Deposit<'info> {
     #[account(
         mut,
-        has_one = admin
+        has_one = admin,
+        has_one = policy
     )]
     pub vault: Account<'info, Vault>,
-    
+
     #[account(mut)]
     pub user: Signer<'info>,
-    
+
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
-    
-    #[account(mut)]
+
+    #[account(
+        mut,
+        constraint = vault_token_account.owner == vault.key() @ VaultError::Unauthorized
+    )]
     pub vault_token_account: Account<'info, TokenAccount>,
-    
-    /// CHECK: Vault admin
+
+    pub policy: Account<'info, Policy>,
+
+    /// CHECK: Vault admin, verified by has_one constraint
     pub admin: AccountInfo<'info>,
-    
+
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    #[account(
+        mut,
+        has_one = admin,
+        has_one = policy,
+        seeds = [b"vault", admin.key().as_ref()],
+        bump = vault.bump
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(mut)]
+    pub user_token_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = vault_token_account.owner == vault.key() @ VaultError::Unauthorized
+    )]
+    pub vault_token_account: Account<'info, TokenAccount>,
+
+    pub policy: Account<'info, Policy>,
+
+    /// CHECK: Vault admin, verified by has_one constraint
+    pub admin: AccountInfo<'info>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct UpdatePolicy<'info> {
+    #[account(
+        mut,
+        has_one = admin
+    )]
+    pub policy: Account<'info, Policy>,
+    
+    pub admin: Signer<'info>,
 }
 
 // Parameter structs

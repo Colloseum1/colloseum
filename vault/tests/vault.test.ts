@@ -24,8 +24,9 @@ describe("vault", () => {
   let userTokenAccount: PublicKey;
   let vaultTokenAccount: PublicKey;
   let vaultPda: PublicKey;
-  let policyPda: PublicKey;
-  let registryPda: PublicKey;
+  let vaultBump: number;
+  let policyKeypair: Keypair;
+  let registryKeypair: Keypair;
 
   before(async () => {
     // Create mint
@@ -56,7 +57,7 @@ describe("vault", () => {
     );
 
     // Derive PDAs
-    [vaultPda] = PublicKey.findProgramAddressSync(
+    [vaultPda, vaultBump] = PublicKey.findProgramAddressSync(
       [Buffer.from("vault"), admin.publicKey.toBuffer()],
       program.programId
     );
@@ -64,7 +65,7 @@ describe("vault", () => {
 
   it("Initializes vault infrastructure", async () => {
     // Initialize policy
-    const policyKeypair = Keypair.generate();
+    policyKeypair = Keypair.generate();
     await program.methods
       .initializePolicy({
         maxSlippageBps: 50, // 0.5%
@@ -85,7 +86,7 @@ describe("vault", () => {
       .rpc();
 
     // Initialize registry
-    const registryKeypair = Keypair.generate();
+    registryKeypair = Keypair.generate();
     const jupiterProgram = new PublicKey("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"); // Mainnet Jupiter
     
     await program.methods
@@ -134,12 +135,13 @@ describe("vault", () => {
     const vaultAccount = await program.account.vault.fetch(vaultPda);
     assert.equal(vaultAccount.admin.toString(), admin.publicKey.toString());
     assert.equal(vaultAccount.baseMint.toString(), mint.toString());
+    assert.equal(vaultAccount.bump, vaultBump);
 
     console.log("✅ Vault infrastructure initialized");
   });
 
   it("Deposits tokens into vault", async () => {
-    const depositAmount = new anchor.BN(100000000); // 100 tokens
+    const depositAmount = new anchor.BN(500000000); // 500 tokens
 
     await program.methods
       .deposit(depositAmount)
@@ -148,6 +150,8 @@ describe("vault", () => {
         user: admin.publicKey,
         userTokenAccount: userTokenAccount,
         vaultTokenAccount: vaultTokenAccount,
+        admin: admin.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
       })
       .rpc();
 
@@ -155,6 +159,166 @@ describe("vault", () => {
     const vaultTokenInfo = await provider.connection.getTokenAccountBalance(vaultTokenAccount);
     assert.equal(vaultTokenInfo.value.amount, depositAmount.toString());
 
+    const userTokenInfo = await provider.connection.getTokenAccountBalance(userTokenAccount);
+    assert.equal(userTokenInfo.value.amount, "500000000"); // 1000 - 500 = 500 remaining
+
     console.log("✅ Deposited successfully");
+  });
+
+  it("Withdraws tokens from vault", async () => {
+    const withdrawAmount = new anchor.BN(200000000); // 200 tokens
+
+    // Get balances before
+    const vaultBalanceBefore = await provider.connection.getTokenAccountBalance(vaultTokenAccount);
+    const userBalanceBefore = await provider.connection.getTokenAccountBalance(userTokenAccount);
+
+    console.log("Before withdrawal:");
+    console.log("  Vault:", vaultBalanceBefore.value.uiAmount);
+    console.log("  User:", userBalanceBefore.value.uiAmount);
+
+    // Withdraw
+    await program.methods
+      .withdraw(withdrawAmount)
+      .accounts({
+        vault: vaultPda,
+        user: admin.publicKey,
+        userTokenAccount: userTokenAccount,
+        vaultTokenAccount: vaultTokenAccount,
+        policy: policyKeypair.publicKey,
+        admin: admin.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    // Verify balances after
+    const vaultBalanceAfter = await provider.connection.getTokenAccountBalance(vaultTokenAccount);
+    const userBalanceAfter = await provider.connection.getTokenAccountBalance(userTokenAccount);
+
+    console.log("After withdrawal:");
+    console.log("  Vault:", vaultBalanceAfter.value.uiAmount);
+    console.log("  User:", userBalanceAfter.value.uiAmount);
+
+    assert.equal(vaultBalanceAfter.value.amount, "300000000"); // 500 - 200 = 300
+    assert.equal(userBalanceAfter.value.amount, "700000000");  // 500 + 200 = 700
+
+    console.log("✅ Withdrawn successfully");
+  });
+
+  it("Prevents withdrawal when paused", async () => {
+    // Pause the policy
+    await program.methods
+      .togglePause()
+      .accounts({
+        policy: policyKeypair.publicKey,
+        admin: admin.publicKey,
+      })
+      .rpc();
+
+    console.log("Policy paused");
+
+    // Try to withdraw (should fail)
+    try {
+      await program.methods
+        .withdraw(new anchor.BN(100000000))
+        .accounts({
+          vault: vaultPda,
+          user: admin.publicKey,
+          userTokenAccount: userTokenAccount,
+          vaultTokenAccount: vaultTokenAccount,
+          policy: policyKeypair.publicKey,
+          admin: admin.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .rpc();
+      
+      assert.fail("Withdrawal should have failed when paused");
+    } catch (error) {
+      assert.include(error.toString(), "Paused");
+      console.log("✅ Withdrawal correctly blocked when paused");
+    }
+
+    // Unpause for remaining tests
+    await program.methods
+      .togglePause()
+      .accounts({
+        policy: policyKeypair.publicKey,
+        admin: admin.publicKey,
+      })
+      .rpc();
+
+    console.log("Policy unpaused");
+  });
+
+  it("Prevents withdrawal exceeding vault balance", async () => {
+    const vaultBalance = await provider.connection.getTokenAccountBalance(vaultTokenAccount);
+    const excessiveAmount = new anchor.BN(
+      Number(vaultBalance.value.amount) + 1000000
+    );
+
+    try {
+      await program.methods
+        .withdraw(excessiveAmount)
+        .accounts({
+          vault: vaultPda,
+          user: admin.publicKey,
+          userTokenAccount: userTokenAccount,
+          vaultTokenAccount: vaultTokenAccount,
+          policy: policyKeypair.publicKey,
+          admin: admin.publicKey,
+          tokenProgram: TOKEN_PROGRAM_ID,
+        })
+        .rpc();
+      
+      assert.fail("Should not allow excessive withdrawal");
+    } catch (error) {
+      console.log("✅ Excessive withdrawal correctly blocked");
+    }
+  });
+
+  it("Completes full cycle: deposit more, then withdraw all", async () => {
+    // Deposit 50 more tokens
+    const depositAmount = new anchor.BN(50000000);
+    await program.methods
+      .deposit(depositAmount)
+      .accounts({
+        vault: vaultPda,
+        user: admin.publicKey,
+        userTokenAccount: userTokenAccount,
+        vaultTokenAccount: vaultTokenAccount,
+        admin: admin.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    console.log("Deposited 50 more tokens");
+
+    // Withdraw everything
+    const vaultBalance = await provider.connection.getTokenAccountBalance(vaultTokenAccount);
+    const withdrawAll = new anchor.BN(vaultBalance.value.amount);
+
+    await program.methods
+      .withdraw(withdrawAll)
+      .accounts({
+        vault: vaultPda,
+        user: admin.publicKey,
+        userTokenAccount: userTokenAccount,
+        vaultTokenAccount: vaultTokenAccount,
+        policy: policyKeypair.publicKey,
+        admin: admin.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    console.log("Withdrew all tokens");
+
+    // Verify vault is empty
+    const finalVaultBalance = await provider.connection.getTokenAccountBalance(vaultTokenAccount);
+    assert.equal(finalVaultBalance.value.amount, "0");
+
+    // Verify user got everything back
+    const finalUserBalance = await provider.connection.getTokenAccountBalance(userTokenAccount);
+    assert.equal(finalUserBalance.value.amount, "1000000000"); // All 1000 tokens back
+    
+    console.log("✅ Full cycle complete - vault is empty, user has all tokens");
   });
 });

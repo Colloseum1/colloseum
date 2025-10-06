@@ -43,4 +43,10 @@ pub enum VaultError {
     
     #[msg("Feature not yet implemented")]
     NotImplemented,
+
+    #[msg("Insufficient balance in vault")]
+    InsufficientBalance,
+    
+    #[msg("Unauthorized access")]
+    Unauthorized,
 }

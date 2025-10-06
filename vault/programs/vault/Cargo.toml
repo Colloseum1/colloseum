@@ -10,6 +10,7 @@ name = "vault"
 [dependencies]
 anchor-lang = "0.31.1"
 anchor-spl = { version = "0.31.1", features = ["token", "associated_token"] }
+pyth-solana-receiver-sdk = "0.2.0"
 borsh = "0.10"
 
 [features]

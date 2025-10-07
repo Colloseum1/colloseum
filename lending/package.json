@@ -17,6 +17,7 @@
   "dependencies": {
     "@mrgnlabs/marginfi-client-v2": "^6.1.4",
     "@mrgnlabs/mrgn-common": "^2.0.5",
+    "@solendprotocol/solend-sdk": "^0.14.26",
     "debug": "^4.4.3"
   }
 }

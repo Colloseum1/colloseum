@@ -14,3 +14,19 @@ CREATE TABLE IF NOT EXISTS sol.jup_quotes (
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (pair, ts);
+
+
+/* Raw Pyth oracle feed history: one row per parsed update */
+CREATE TABLE IF NOT EXISTS sol.oracles_unified (
+  ts            DateTime64(3, 'UTC'),
+  slot          UInt64,
+  feed_id       String,
+  source        String,
+  price_fp6     UInt128,
+  expo          Int8,
+  ingest_ts     DateTime64(3, 'UTC') DEFAULT now(),
+  raw           String
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (feed_id, ts);

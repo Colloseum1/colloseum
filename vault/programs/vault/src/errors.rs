@@ -49,4 +49,7 @@ pub enum VaultError {
     
     #[msg("Unauthorized access")]
     Unauthorized,
+
+    #[msg("Invalid Jupiter route plan data")]
+    InvalidRoutePlan,
 }

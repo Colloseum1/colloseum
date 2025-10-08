@@ -1,209 +1,232 @@
-#https://benchmarks.pyth.network
-#feeds id gotten from feed ids: https://docs.pyth.network/price-feeds/price-feeds#feed-ids
-import os
-import requests
-import json
-import redis
+# data_plane/pyth.py
+from __future__ import annotations
+import os, time, json
+from datetime import datetime, timezone
+from decimal import Decimal, getcontext, ROUND_HALF_UP
+from typing import List, Dict, Any, Optional, Iterable
+
+import requests, redis
 from dotenv import load_dotenv
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any
 
-# load .env so env vars (CLICKHOUSE_HTTP, REDIS_URL, etc.) work when running this module
-load_dotenv(dotenv_path=".env")
+# -----------------------------------------------------------------------------
+# Env & clients
+# -----------------------------------------------------------------------------
+load_dotenv(".env")
 
-# ClickHouse/Redis settings (fall back to sensible locals)
 CLICKHOUSE_HTTP = os.getenv("CLICKHOUSE_HTTP", "http://localhost:8123")
 CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "ch")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "chpwd")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL  = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# redis client used for PIT/latest
-rds = redis.from_url(REDIS_URL, decode_responses=True)
+PYTH_BASE = os.getenv("PYTH_BASE", "https://benchmarks.pyth.network").rstrip("/")
+PYTH_FEEDS_RAW = os.getenv("PYTH_FEEDS", "").replace(",", "\n").strip()
+PYTH_POLL_SECONDS  = int(os.getenv("PYTH_POLL_SECONDS", "30"))
+PYTH_WINDOW_SECONDS= int(os.getenv("PYTH_WINDOW_SECONDS", "60"))  # API requires <= 60
+PYTH_FINALITY_LAG  = int(os.getenv("PYTH_FINALITY_LAG", "45"))    # initial slack seconds
+MAX_RETRIES        = int(os.getenv("PYTH_MAX_RETRIES", "3"))
+PYTH_DEBUG         = os.getenv("PYTH_DEBUG", "0") == "1"
 
-# timestamp = 1752004800  # July 8, 2025, 4PM ET
-# price_feed_id = "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d"  # SOL/USD
-# url = f"https://benchmarks.pyth.network/v1/updates/price/{timestamp}"
-# params = {
-#     "ids": price_feed_id,
-#     "encoding": "hex",
-#     "parsed": "true"
-# }
+TIMEOUT = 15
+sess = requests.Session(); sess.headers.update({"Accept": "application/json"})
+rds  = redis.from_url(REDIS_URL, decode_responses=True)
+getcontext().prec = 40
 
-# response = requests.get(url, params=params)
-# if response.status_code == 200:
-#     data = response.json()
-#     if 'binary' in data:
-#         data.pop('binary')
-#     print(json.dumps(data, indent=4))
-# else:
-#     print("Error:", response.status_code, response.text)
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def now_ts_str_ms() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-def get_data_from_pyth(price_feed_id: str, timestamp: int):
-    params={
-        "ids": price_feed_id,
-        "encoding": "hex",
-        "parsed": "true"
-    }
-    url = f"https://benchmarks.pyth.network/v1/updates/price/{timestamp}"
-    response = requests.get(url, params=params)
-    if response.status_code == 200:
-        data = response.json()
-        if 'binary' in data:
-            data.pop('binary')
-            print(json.dumps(data, indent=4))
-        return data
-    else:
-        print("Error:", response.status_code, response.text)
+def to_fp6_from_price_expo(price: int | str, expo: int | str) -> int:
+    """
+    Pyth value = price * 10^expo
+    We store fixed-point 1e6: round(value * 1e6)
+    """
+    try:
+        p = Decimal(str(price))
+        e = int(expo)
+        val = p * (Decimal(10) ** Decimal(e))
+        fp6 = (val * Decimal(1_000_000)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        return int(fp6)
+    except Exception:
+        return 0
 
-
-def _ch_insert(table: str, rows: List[Dict[str, Any]]):
-    """Insert rows into ClickHouse using JSONEachRow via HTTP endpoint."""
+def ch_insert_json_each_row(table: str, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
     payload = "\n".join(json.dumps(r, separators=(",", ":")) for r in rows)
     sql = f"INSERT INTO {table} FORMAT JSONEachRow\n{payload}"
-    r = requests.post(CLICKHOUSE_HTTP, data=sql, auth=(CLICKHOUSE_USER, CLICKHOUSE_PASSWORD), timeout=15)
+    r = sess.post(CLICKHOUSE_HTTP, data=sql, auth=(CLICKHOUSE_USER, CLICKHOUSE_PASSWORD), timeout=TIMEOUT)
     if r.status_code >= 400:
-        # propagate error so caller can decide how to handle
         raise RuntimeError(f"ClickHouse insert error {r.status_code}: {r.text}")
 
-
-def parse_and_store_pyth(response_json: Dict[str, Any]):
-    """Parse Pyth `parsed` array and store:
-      - raw row(s) into ClickHouse table `sol.oracles_unified`
-      - latest per-feed PIT into Redis key `latest:feed:{feed_id}` as JSON
-
-    Extracted fields (minimum):
-      - ts (from price.publish_time) -> stored as RFC timestamp string
-      - slot (from metadata.slot)
-      - feed_id (from id)
-      - price_fp6 (from price.price) -> int
-      - expo (from price.expo) -> int
+# -----------------------------------------------------------------------------
+# Pyth fetchers
+# -----------------------------------------------------------------------------
+def pyth_updates_window(price_feed_ids: List[str], end_ts: int, window_sec: int) -> Any:
     """
-    parsed = response_json.get("parsed") or []
-    if not parsed:
-        return
+    GET /v1/updates/price/{end_ts}/{window_sec}
+      - ids must be repeated params
+      - window_sec must be <= 60
+    Response may be:
+      - dict with key 'parsed' (list), or
+      - top-level list of parsed entries
+    """
+    if not price_feed_ids:
+        return None
 
-    rows = []
-    # format ingest_ts and ts fields to match ClickHouse DateTime64(3) (milliseconds, no timezone)
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    window_sec = min(max(window_sec, 1), 60)
+    params: List[tuple[str,str]] = [("encoding","hex"), ("parsed","true"), ("unique","true")]
+    for fid in price_feed_ids:
+        params.append(("ids", fid))
 
-    for entry in parsed:
-        feed_id = entry.get("id")
-        price_obj = entry.get("price") or {}
-        metadata = entry.get("metadata") or {}
+    url = f"{PYTH_BASE}/v1/updates/price/{end_ts}/{window_sec}"
+    r = sess.get(url, params=params, timeout=TIMEOUT)
+    if r.status_code >= 400:
+        raise requests.HTTPError(f"{r.status_code} {r.reason}: {r.text}", response=r)
+    return r.json()
 
+def extract_parsed_entries(resp: Any) -> List[dict]:
+    """
+    Normalize the response into a flat list of parsed entries with fields:
+      id, price.{price, expo, publish_time}, metadata.slot, ...
+    Handles:
+      - {"parsed": [ ... ]}
+      - [ ... ]  (top-level list of entries or list of items each with 'parsed')
+    """
+    out: List[dict] = []
+    if resp is None:
+        return out
+
+    if isinstance(resp, dict):
+        # dict with 'parsed' or 'data'
+        arr = resp.get("parsed") or resp.get("data")
+        if isinstance(arr, list):
+            out = [x for x in arr if isinstance(x, dict)]
+        else:
+            # sometimes the dict itself may look like a parsed entry
+            if isinstance(resp.get("price"), dict) and resp.get("id"):
+                out = [resp]
+    elif isinstance(resp, list):
+        # could be list of parsed entries, or list of wrappers (each with parsed)
+        for item in resp:
+            if isinstance(item, dict):
+                if "parsed" in item and isinstance(item["parsed"], list):
+                    out.extend([x for x in item["parsed"] if isinstance(x, dict)])
+                else:
+                    # direct parsed-like entry
+                    if item.get("id") and isinstance(item.get("price"), dict):
+                        out.append(item)
+
+    if PYTH_DEBUG:
+        print(f"[DEBUG] extract_parsed_entries: type={type(resp).__name__} -> {len(out)} entries")
+        if out[:1]:
+            print("[DEBUG] sample keys:", list(out[0].keys()))
+    return out
+
+# -----------------------------------------------------------------------------
+# Parse & store
+# -----------------------------------------------------------------------------
+def parse_and_store_pyth(response_json: Any) -> int:
+    entries = extract_parsed_entries(response_json)
+    if not entries:
+        return 0
+
+    rows: List[Dict[str, Any]] = []
+    ingest_ts = now_ts_str_ms()
+
+    for entry in entries:
         try:
+            feed_id = entry.get("id")
+            price_obj = entry.get("price") or {}
+            meta = entry.get("metadata") or {}
+
             publish_time = price_obj.get("publish_time")
-            slot = metadata.get("slot")
             price_raw = price_obj.get("price")
             expo = price_obj.get("expo")
+            slot = meta.get("slot")
 
-            if feed_id is None or publish_time is None or slot is None or price_raw is None or expo is None:
-                # skip incomplete
+            if not (feed_id and publish_time is not None and price_raw is not None and expo is not None and slot is not None):
+                if PYTH_DEBUG:
+                    print("[DEBUG] skipping incomplete entry:", json.dumps(entry)[:200])
                 continue
 
-            ts_int = int(publish_time)
-            slot_i = int(slot)
-            price_fp6 = int(price_raw)
-            expo_i = int(expo)
+            ts_str = datetime.fromtimestamp(int(publish_time), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            price_fp6 = to_fp6_from_price_expo(price_raw, expo)
 
-            ts_str = datetime.fromtimestamp(ts_int, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
-            # prepare ClickHouse raw row
-            rows.append({
+            row = {
                 "ts": ts_str,
-                "slot": slot_i,
-                "feed_id": feed_id,
+                "slot": int(slot),
+                "feed_id": str(feed_id),
                 "source": "pyth",
                 "price_fp6": price_fp6,
-                "expo": expo_i,
-                "ingest_ts": now_iso,
+                "expo": int(expo),
+                "ingest_ts": ingest_ts,
                 "raw": json.dumps(entry, separators=(",", ":")),
-            })
-
-            # Update Redis PIT/latest: keep structured JSON under key latest:feed:<feed_id>
-            latest_key = f"latest:feed:{feed_id}"
-            latest_payload = {
-                "ts": ts_str,
-                "slot": slot_i,
-                "feed_id": feed_id,
-                "price_fp6": price_fp6,
-                "expo": expo_i,
-                "source": "pyth",
-                "ingest_ts": now_iso,
             }
-            try:
-                rds.set(latest_key, json.dumps(latest_payload, separators=(",", ":")))
-            except Exception:
-                # don't fail entire batch if Redis write fails
-                pass
+            rows.append(row)
 
-        except Exception:
-            # skip malformed entry
+            # Redis latest snapshot
+            rds.set(f"latest:feed:{feed_id}", json.dumps({
+                "ts": ts_str, "slot": int(slot), "feed_id": str(feed_id),
+                "price_fp6": price_fp6, "expo": int(expo),
+                "source": "pyth", "ingest_ts": ingest_ts
+            }, separators=(",", ":")))
+        except Exception as e:
+            if PYTH_DEBUG:
+                print("[DEBUG] entry parse error:", repr(e))
             continue
 
     if rows:
-        _ch_insert("sol.oracles_unified", rows)
+        ch_insert_json_each_row("sol.oracles_unified", rows)
+    return len(rows)
 
+# -----------------------------------------------------------------------------
+# Backoff wrapper (avoid future timestamps)
+# -----------------------------------------------------------------------------
+def fetch_with_backoff(feeds: List[str], window: int) -> Any:
+    last_err: Optional[Exception] = None
+    for attempt in range(MAX_RETRIES + 1):
+        slack = PYTH_FINALITY_LAG + attempt * 30  # +30s per retry
+        end_ts = int(time.time()) - slack
+        try:
+            return pyth_updates_window(feeds, end_ts, window)
+        except requests.HTTPError as e:
+            last_err = e
+            msg = (e.response.text if getattr(e, "response", None) else str(e))[:200]
+            if "Timestamp cannot be in the future" in msg and attempt < MAX_RETRIES:
+                if PYTH_DEBUG:
+                    print(f"[DEBUG] future ts; retrying with more slack (attempt {attempt+1})")
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            break
+    if last_err:
+        raise last_err
 
-def fetch_and_process_pyth(price_feed_id: str, timestamp: int):
-    """Helper: fetch from Pyth and store results (ClickHouse raw + Redis PIT)."""
-    data = get_data_from_pyth(price_feed_id, timestamp)
-    if data:
-        parse_and_store_pyth(data)
-
-
+# -----------------------------------------------------------------------------
+# Main loop
+# -----------------------------------------------------------------------------
 def main():
-    """Poll configured PYTH_FEEDS at PYTH_POLL_SECONDS and process updates.
-
-    Environment variables:
-      PYTH_FEEDS - multiline string, each line a price feed id
-      PYTH_POLL_SECONDS - seconds between polls (default 60)
-      PYTH_TIMESTAMP - optional fixed timestamp to request (int); if not set uses current unix time
-    """
-    import os, time
-
-    feeds_env = os.getenv("PYTH_FEEDS", "").strip()
-    if not feeds_env:
-        print("No PYTH_FEEDS configured in env; set PYTH_FEEDS with feed ids (one per line)")
+    if not PYTH_FEEDS_RAW:
+        print("No PYTH_FEEDS configured. Set PYTH_FEEDS in .env (comma or newline separated feed IDs).")
         return
 
-    feeds = [line.strip() for line in feeds_env.splitlines() if line.strip()]
-    poll_seconds = int(os.getenv("PYTH_POLL_SECONDS", "60"))
-    fixed_ts = os.getenv("PYTH_TIMESTAMP")
+    feeds = [ln.strip() for ln in PYTH_FEEDS_RAW.splitlines() if ln.strip()]
+    window = min(max(PYTH_WINDOW_SECONDS, 1), 60)
+    print(f"Starting Pyth poller… feeds={len(feeds)} window={window}s interval={PYTH_POLL_SECONDS}s (initial lag={PYTH_FINALITY_LAG}s)")
 
-    print(f"Starting Pyth poller for {len(feeds)} feeds, interval={poll_seconds}s")
     while True:
-        ts = int(fixed_ts) if fixed_ts else int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp())
-        for feed in feeds:
-            try:
-                fetch_and_process_pyth(feed, ts)
-            except Exception as e:
-                print(f"[feed:{feed}] error: {e}")
-        time.sleep(poll_seconds)
-
+        try:
+            data = fetch_with_backoff(feeds, window)
+            wrote = parse_and_store_pyth(data)
+            print(f"[tick {now_ts_str_ms()}] pyth: wrote={wrote}")
+        except requests.HTTPError as e:
+            print("[pyth] HTTP error:", e)
+        except Exception as e:
+            print("[pyth] error:", e)
+        time.sleep(PYTH_POLL_SECONDS)
 
 if __name__ == "__main__":
     main()
-
-# get_data_from_pyth("ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d", 1752004800)
-# def get_data_from_pyth_interval(price_feed_id:str, timestamp:str, interval:int):
-#     params={
-#         "ids": price_feed_id,
-#         "encoding": "hex",
-#         "parsed": "true",
-#         "unique": "true",
-#     }
-#     url = f"https://benchmarks.pyth.network/v1/updates/price/{timestamp}/{interval}"
-#     response = requests.get(url, params=params)
-#     if response.status_code == 200:
-#         data = response.json()
-#         if 'binary' in data:
-#             data.pop('binary')
-#             print(json.dumps(data, indent=4))
-#         return data
-#     else:
-#         print("Error:", response.status_code, response.text)
-
-# get_data_from_pyth_interval("e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43", 1752004800,60)

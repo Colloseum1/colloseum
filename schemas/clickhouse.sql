@@ -30,3 +30,14 @@ CREATE TABLE IF NOT EXISTS sol.oracles_unified (
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (feed_id, ts);
+
+/* Recent prioritization fee median per sample window */
+CREATE TABLE IF NOT EXISTS sol.prioritization_fees (
+  ts                          DateTime64(3, 'UTC'),
+  slot                        UInt64,
+  p50_fee_microlamports_per_cu UInt64,
+  ingest_ts                   DateTime64(3, 'UTC') DEFAULT now()
+)
+ENGINE = MergeTree
+PARTITION BY toYYYYMM(ts)
+ORDER BY (ts, slot);

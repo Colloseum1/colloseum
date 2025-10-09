@@ -60,9 +60,6 @@ pub fn read_pyth_price(
     Ok(PythPrice {
         price: price_i64,
         exponent,
-        confidence,
-        confidence_bps,
-        timestamp: Clock::get()?.unix_timestamp,
     })
 }
 
@@ -105,36 +102,11 @@ pub fn validate_price_deviation(
     Ok(())
 }
 
-/// Calculate minimum output with slippage protection
-pub fn calculate_min_output_with_slippage(
-    amount_in: u64,
-    route_price_fp6: u128,
-    max_slippage_bps: u16,
-) -> Result<u64> {
-    // Calculate expected output at route price
-    let expected_out = (amount_in as u128)
-        .checked_mul(route_price_fp6)
-        .ok_or(VaultError::SlippageExceeded)?
-        / 1_000_000u128;
-
-    // Apply slippage tolerance
-    let slippage_multiplier = 10_000u128 - max_slippage_bps as u128;
-    let min_out = expected_out
-        .checked_mul(slippage_multiplier)
-        .ok_or(VaultError::SlippageExceeded)?
-        / 10_000u128;
-
-    Ok(min_out as u64)
-}
-
 /// Pyth price data
 #[derive(Debug, Clone)]
 pub struct PythPrice {
     pub price: i64,
     pub exponent: i32,
-    pub confidence: u64,
-    pub confidence_bps: u32,
-    pub timestamp: i64,
 }
 
 #[cfg(test)]
@@ -167,16 +139,4 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_slippage_calculation() {
-        // 1000 USDC in, price 1.0, slippage 50 bps (0.5%)
-        let min_out = calculate_min_output_with_slippage(
-            1_000_000_000, // 1000 USDC (6 decimals)
-            1_000_000,     // 1.0 price
-            50,            // 0.5% slippage
-        ).unwrap();
-        
-        // Expected: 1000 * 0.995 = 995
-        assert_eq!(min_out, 995_000_000);
-    }
 }

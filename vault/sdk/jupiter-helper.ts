@@ -1,4 +1,14 @@
-import { Connection, PublicKey, VersionedTransaction, AccountMeta } from "@solana/web3.js";
+import {
+  Connection,
+  PublicKey,
+  VersionedTransaction,
+  AccountMeta,
+} from "@solana/web3.js";
+
+const JUPITER_PROGRAM_ID = new PublicKey(
+  "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+);
+const JUPITER_API_URL = "https://lite-api.jup.ag/swap/v1";
 
 export interface JupiterQuote {
   inputMint: string;
@@ -9,172 +19,153 @@ export interface JupiterQuote {
   swapMode: string;
   slippageBps: number;
   priceImpactPct: string;
-  routePlan: any[];
 }
 
 export interface JupiterSwapData {
-  routeId: number;
-  routePlan: Buffer;
-  jupiterAccounts: {
-    programAuthority: PublicKey;
-    programSourceTokenAccount: PublicKey;
-    programDestTokenAccount: PublicKey;
-  };
-  remainingAccounts: AccountMeta[];
+  fullInstructionData: Buffer;
+  allAccounts: AccountMeta[];
   quote: JupiterQuote;
-  platformFeeBps: number;
 }
 
-export async function getJupiterQuote(
+/**
+ * Fetch Jupiter quote from API
+ */
+async function fetchQuote(
   inputMint: PublicKey,
   outputMint: PublicKey,
   amount: number,
-  slippageBps: number = 50
+  slippageBps: number
 ): Promise<JupiterQuote> {
-  const response = await fetch(
-    `https://quote-api.jup.ag/v6/quote?` +
+  const url =
+    `${JUPITER_API_URL}/quote?` +
     `inputMint=${inputMint.toString()}&` +
     `outputMint=${outputMint.toString()}&` +
     `amount=${amount}&` +
-    `slippageBps=${slippageBps}`
-  );
+    `slippageBps=${slippageBps}`;
 
+  const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Jupiter quote failed: ${response.statusText}`);
   }
-
-  return await response.json();
+  return (await response.json()) as JupiterQuote;
 }
 
-export async function getJupiterSwapInstructions(
+/**
+ * Fetch Jupiter swap transaction from API
+ */
+async function fetchSwapTransaction(
   quote: JupiterQuote,
   userPublicKey: PublicKey
-): Promise<any> {
-  const response = await fetch("https://quote-api.jup.ag/v6/swap", {
+): Promise<string> {
+  const response = await fetch(`${JUPITER_API_URL}/swap`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       quoteResponse: quote,
       userPublicKey: userPublicKey.toString(),
       wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
     }),
   });
 
   if (!response.ok) {
-    throw new Error(`Jupiter swap instructions failed: ${response.statusText}`);
+    throw new Error(`Jupiter swap failed: ${response.statusText}`);
   }
-
-  return await response.json();
+  const data = (await response.json()) as { swapTransaction: string };
+  return data.swapTransaction;
 }
 
 /**
- * Extract Jupiter swap data from API response for vault CPI
- * This parses the Jupiter transaction to extract route_id, route_plan, and accounts
+ * Load Address Lookup Tables from transaction
+ */
+async function loadAddressLookupTables(
+  message: any,
+  connection: Connection
+): Promise<PublicKey[]> {
+  const lookupAccounts: PublicKey[] = [];
+
+  if (message.addressTableLookups && message.addressTableLookups.length > 0) {
+    for (const lookup of message.addressTableLookups) {
+      const lookupTable = await connection.getAddressLookupTable(
+        lookup.accountKey
+      );
+      if (lookupTable.value) {
+        lookupAccounts.push(...lookupTable.value.state.addresses);
+      }
+    }
+  }
+
+  return lookupAccounts;
+}
+
+/**
+ * Get Jupiter swap data for vault CPI
+ *
+ * Fetches quote and transaction from Jupiter API, extracts instruction data
+ * and accounts, then replaces dummy accounts with actual vault accounts.
  */
 export async function getJupiterSwapData(
   inputMint: PublicKey,
   outputMint: PublicKey,
   amount: number,
   slippageBps: number,
-  vaultPda: PublicKey
+  vaultPda: PublicKey,
+  vaultSourceTokenAccount: PublicKey,
+  vaultDestTokenAccount: PublicKey,
+  connection: Connection
 ): Promise<JupiterSwapData> {
-  // 1. Get quote from Jupiter
-  const quote = await getJupiterQuote(inputMint, outputMint, amount, slippageBps);
+  // 1. Get quote
+  const quote = await fetchQuote(inputMint, outputMint, amount, slippageBps);
 
   // 2. Get swap transaction
-  const swapResponse = await getJupiterSwapInstructions(quote, vaultPda);
-
-  // 3. Deserialize the transaction
-  const transaction = VersionedTransaction.deserialize(
-    Buffer.from(swapResponse.swapTransaction, 'base64')
+  const swapTxBase64 = await fetchSwapTransaction(quote, vaultPda);
+  const tx = VersionedTransaction.deserialize(
+    Buffer.from(swapTxBase64, "base64")
   );
 
-  // 4. Find the Jupiter swap instruction (usually the first or main instruction)
-  const message = transaction.message;
-  const jupiterProgramId = new PublicKey('JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4');
+  // 3. Load address lookup tables
+  const lookupAccounts = await loadAddressLookupTables(tx.message, connection);
+  const allAccountKeys = [...tx.message.staticAccountKeys, ...lookupAccounts];
 
-  let jupiterInstructionIndex = -1;
-  for (let i = 0; i < message.compiledInstructions.length; i++) {
-    const programIdIndex = message.compiledInstructions[i].programIdIndex;
-    const programId = message.staticAccountKeys[programIdIndex];
-    if (programId.equals(jupiterProgramId)) {
-      jupiterInstructionIndex = i;
-      break;
-    }
+  // 4. Find Jupiter instruction
+  const jupiterIx = tx.message.compiledInstructions.find((ix) =>
+    tx.message.staticAccountKeys[ix.programIdIndex].equals(JUPITER_PROGRAM_ID)
+  );
+
+  if (!jupiterIx) {
+    throw new Error("Jupiter instruction not found in transaction");
   }
 
-  if (jupiterInstructionIndex === -1) {
-    throw new Error('Jupiter instruction not found in transaction');
-  }
+  // 5. Extract and replace accounts
+  // Replace dummy accounts with actual vault accounts at known indices:
+  // - Index 2: user_transfer_authority -> vaultPda
+  // - Index 3: user_source_token -> vaultSourceTokenAccount
+  // - Index 6: user_dest_token -> vaultDestTokenAccount
+  const allAccounts: AccountMeta[] = jupiterIx.accountKeyIndexes
+    .map((keyIndex, idx) => {
+      let pubkey = allAccountKeys[keyIndex];
 
-  const jupiterInstruction = message.compiledInstructions[jupiterInstructionIndex];
-  const instructionData = Buffer.from(jupiterInstruction.data);
+      // Replace with vault accounts
+      if (idx === 2) pubkey = vaultPda;
+      if (idx === 3) pubkey = vaultSourceTokenAccount;
+      if (idx === 6) pubkey = vaultDestTokenAccount;
 
-  // 5. Parse instruction data
-  // Format: [discriminator:8][id:1][route_plan:variable][in_amount:8][quoted_out_amount:8][slippage_bps:2][platform_fee_bps:1]
-  const routeId = instructionData.readUInt8(8); // After 8-byte discriminator
-
-  // Find where route_plan ends (this is tricky - we need to parse the route plan structure)
-  // For now, we'll extract the full instruction data after the discriminator and route_id
-  // The client will need to send this to the vault program
-  const routePlanStart = 9;
-  // Route plan is variable length, so we extract everything after route_id up to the fixed params at the end
-  // Fixed params at end: in_amount(8) + quoted_out_amount(8) + slippage_bps(2) + platform_fee_bps(1) = 19 bytes
-  const routePlanEnd = instructionData.length - 19;
-  const routePlan = instructionData.slice(routePlanStart, routePlanEnd);
-
-  // Extract platform fee (last byte)
-  const platformFeeBps = instructionData.readUInt8(instructionData.length - 1);
-
-  // 6. Extract account metas
-  const accounts = jupiterInstruction.accountKeyIndexes.map((keyIndex: number) => {
-    const pubkey = message.staticAccountKeys[keyIndex];
-    // Determine if writable/signer from message
-    const isWritable = message.compiledInstructions[jupiterInstructionIndex].accountKeyIndexes.includes(keyIndex);
-    return {
-      pubkey,
-      isSigner: false,
-      isWritable,
-    };
-  });
-
-  // 7. Identify Jupiter-specific accounts
-  // These are typically in fixed positions for SharedAccountsRoute
-  const programAuthority = accounts[1]?.pubkey; // Jupiter's program authority
-  const programSourceTokenAccount = accounts[4]?.pubkey; // Jupiter's temp source account
-  const programDestTokenAccount = accounts[5]?.pubkey; // Jupiter's temp dest account
-
-  // Remaining accounts are route-specific (DEX accounts, pools, etc.)
-  const remainingAccounts = accounts.slice(11); // After the fixed SharedAccountsRoute accounts
+      return { pubkey, isSigner: false, isWritable: true };
+    })
+    .filter((acc) => acc.pubkey); // Remove undefined
 
   return {
-    routeId,
-    routePlan,
-    jupiterAccounts: {
-      programAuthority: programAuthority || PublicKey.default,
-      programSourceTokenAccount: programSourceTokenAccount || PublicKey.default,
-      programDestTokenAccount: programDestTokenAccount || PublicKey.default,
-    },
-    remainingAccounts,
+    fullInstructionData: Buffer.from(jupiterIx.data),
+    allAccounts,
     quote,
-    platformFeeBps,
   };
 }
 
 /**
- * Calculate route mid price in 6 decimal fixed point
+ * Calculate route price in 6 decimal fixed point
+ * Used for vault validation against oracle price
  */
 export function calculateRoutePriceFp6(quote: JupiterQuote): bigint {
   const inAmount = BigInt(quote.inAmount);
   const outAmount = BigInt(quote.outAmount);
-
-  // Price = outAmount / inAmount, scaled to 6 decimals
-  // For example: if swapping 1 USDC (1000000) to get 0.005 SOL (5000000 lamports)
-  // Price = 5000000 / 1000000 = 5 (scaled to 6 decimals = 5000000)
-  const priceFp6 = (outAmount * BigInt(1000000)) / inAmount;
-
-  return priceFp6;
+  return (outAmount * BigInt(1000000)) / inAmount;
 }

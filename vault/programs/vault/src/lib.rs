@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer, Mint};
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
 mod errors;
 mod policy;
@@ -277,8 +277,8 @@ pub mod vault {
             VaultError::ProgramNotAllowed
         );
 
-        // Add oracle validation before swap (if feed ID provided)
-        if let Some(ref feed_id) = args.price_feed_id {
+        // 5. Add oracle validation before swap (if feed ID provided)
+        let oracle_price_value = if let Some(ref feed_id) = args.price_feed_id {
             if let Some(oracle_account) = ctx.remaining_accounts.first() {
                 let oracle_limits = price::OracleLimits {
                     max_age_slots: policy.max_oracle_age_slots,
@@ -298,24 +298,30 @@ pub mod vault {
                     args.route_price_fp6,
                     policy.max_oracle_delta_bps,
                 )?;
-            }
-        }
 
-        // 5. Verify token mints are allowed
+                oracle_price.price
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // 6. Verify token mints are allowed
         policy.is_mint_allowed(&ctx.accounts.vault_source_token_account.mint)?;
         policy.is_mint_allowed(&ctx.accounts.vault_dest_token_account.mint)?;
 
-        // 6. Validate slippage against policy
+        // 7. Validate slippage against policy
         require!(
             args.slippage_bps <= policy.max_slippage_bps,
             VaultError::SlippageExceeded
         );
 
-        // 7. Check notional caps (simplified - using quoted amount as USD proxy)
+        // 8. Check notional caps (simplified - using quoted amount as USD proxy)
         let notional_usd_cents = (args.quoted_out_amount / 10_000) as u64; // Rough conversion
         policy.check_and_update_daily_cap(notional_usd_cents)?;
 
-        // 8. Execute Jupiter swap via CPI
+        // 9. Execute Jupiter swap via CPI
         let admin_key = vault.admin;
         let bump = &[vault.bump];
         let signer_seeds: &[&[&[u8]]] = &[&[
@@ -324,28 +330,15 @@ pub mod vault {
             bump,
         ]];
 
+        // Execute Jupiter swap by forwarding the complete instruction
         cpi::jupiter::execute_jupiter_swap(
             ctx.accounts.jupiter_program.to_account_info(),
-            ctx.accounts.token_program.to_account_info(),
-            ctx.accounts.program_authority.to_account_info(),
-            ctx.accounts.vault.to_account_info(), // vault PDA as user_transfer_authority
-            ctx.accounts.vault_source_token_account.to_account_info(),
-            ctx.accounts.program_source_token_account.to_account_info(),
-            ctx.accounts.program_dest_token_account.to_account_info(),
-            ctx.accounts.vault_dest_token_account.to_account_info(),
-            ctx.accounts.source_mint.to_account_info(),
-            ctx.accounts.dest_mint.to_account_info(),
-            args.jupiter_route_id,
-            args.route_plan,
-            args.amount_in,
-            args.quoted_out_amount,
-            args.slippage_bps,
-            args.platform_fee_bps,
+            args.jupiter_instruction_data,
+            ctx.remaining_accounts, // ALL Jupiter accounts passed via remaining_accounts
             signer_seeds,
-            ctx.remaining_accounts,
         )?;
 
-        // 9. Emit swap event
+        // 10. Emit swap event
         emit!(SwapEvent {
             vault: vault.key(),
             user: ctx.accounts.admin.key(),
@@ -353,7 +346,7 @@ pub mod vault {
             output_mint: ctx.accounts.vault_dest_token_account.mint,
             amount_in: args.amount_in,
             amount_out: args.quoted_out_amount,
-            oracle_price: 0, // Set this if you add oracle validation
+            oracle_price: oracle_price_value,
             slippage_bps: args.slippage_bps,
             timestamp: Clock::get()?.unix_timestamp,
             slot: Clock::get()?.slot,
@@ -364,7 +357,7 @@ pub mod vault {
     }
 
     /// Close vault account and return rent to admin (for testing only)
-    pub fn close_vault(ctx: Context<CloseVault>) -> Result<()> {
+    pub fn close_vault(_ctx: Context<CloseVault>) -> Result<()> {
         msg!("Closing vault and returning rent to admin");
         Ok(())
     }
@@ -515,36 +508,28 @@ pub struct SwapTokens<'info> {
 
     pub registry: Account<'info, SourceRegistry>,
 
-    // Jupiter-specific accounts
+    // Jupiter program
     /// CHECK: Validated against registry
     pub jupiter_program: AccountInfo<'info>,
 
-    /// CHECK: Jupiter's program authority PDA
-    pub program_authority: AccountInfo<'info>,
-
-    // Vault's token accounts
-    #[account(mut)]
+    // Vault's token accounts (for validation and event emission only, not used in CPI)
+    #[account(
+        mut,
+        constraint = vault_source_token_account.owner == vault.key() @ VaultError::Unauthorized
+    )]
     pub vault_source_token_account: Account<'info, TokenAccount>,
 
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = vault_dest_token_account.owner == vault.key() @ VaultError::Unauthorized
+    )]
     pub vault_dest_token_account: Account<'info, TokenAccount>,
 
-    // Jupiter's temporary token accounts
-    /// CHECK: Jupiter's temporary source token account
-    #[account(mut)]
-    pub program_source_token_account: AccountInfo<'info>,
-
-    /// CHECK: Jupiter's temporary destination token account
-    #[account(mut)]
-    pub program_dest_token_account: AccountInfo<'info>,
-
-    // Token mints
-    pub source_mint: Account<'info, Mint>,
-    pub dest_mint: Account<'info, Mint>,
-
     pub admin: Signer<'info>,
-    pub token_program: Program<'info, Token>,
-    pub system_program: Program<'info, System>,
+
+    // Note: All Jupiter accounts (token_program, program_authority, vault PDA,
+    // vault token accounts, mints, and DEX-specific accounts) are passed via remaining_accounts
+    // in the exact order required by Jupiter API
 }
 
 #[derive(Accounts)]
@@ -588,14 +573,13 @@ pub struct PolicyParams {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct SwapArgs {
+    // Vault validation parameters
     pub amount_in: u64,
     pub quoted_out_amount: u64,
-    pub slippage_bps: u16,  // Changed from u64 to match Jupiter
-    pub route_price_fp6: u128,  // Price from Jupiter quote (6 decimals)
-    pub price_feed_id: Option<String>,  // Pyth price feed ID (optional)
+    pub slippage_bps: u16,
+    pub route_price_fp6: u128,  // Price from Jupiter quote (6 decimals fixed point)
+    pub price_feed_id: Option<String>,  // Pyth price feed ID (optional, for oracle validation)
 
-    // Jupiter-specific parameters
-    pub jupiter_route_id: u8,
-    pub route_plan: Vec<u8>,  // Serialized RoutePlanStep[]
-    pub platform_fee_bps: u8,
+    // Jupiter CPI - complete instruction data from Jupiter API
+    pub jupiter_instruction_data: Vec<u8>,
 }

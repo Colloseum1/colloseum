@@ -101,6 +101,11 @@ impl Policy {
     }
 
     /// Validate compute limits
+    ///
+    /// Note: Not currently enforced in swap_tokens. This is available for future use
+    /// if compute budget instructions need to be validated against policy limits.
+    /// The policy stores these limits for configuration purposes.
+    #[allow(dead_code)]
     pub fn validate_compute_limits(
         &self,
         compute_units: u32,

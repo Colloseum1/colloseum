@@ -1,2 +1,8 @@
 requests
 redis
+solana
+solders
+requests
+websockets
+pandas
+aiohttp

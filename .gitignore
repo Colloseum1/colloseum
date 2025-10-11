@@ -37,3 +37,4 @@ next-env.d.ts
 
 venv
 node_modules
+.venv_fee_test

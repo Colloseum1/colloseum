@@ -4,7 +4,6 @@ import os, time, json
 from datetime import datetime, timezone
 from decimal import Decimal, getcontext, ROUND_HALF_UP
 from typing import List, Dict, Any, Optional, Iterable
-
 import requests, redis
 from dotenv import load_dotenv
 

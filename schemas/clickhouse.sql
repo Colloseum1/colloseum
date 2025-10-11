@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS sol.jup_quotes (
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (pair, ts);
+<<<<<<< HEAD
 
 
 /* Raw Pyth oracle feed history: one row per parsed update */
@@ -41,3 +42,5 @@ CREATE TABLE IF NOT EXISTS sol.prioritization_fees (
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(ts)
 ORDER BY (ts, slot);
+=======
+>>>>>>> fce4847 (grafana)

@@ -1,0 +1,13 @@
+apiVersion: 1
+datasources:
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    isDefault: true
+    jsonData:
+      server: http://clickhouse:8123
+      defaultDatabase: sol
+      username: ch
+      tlsSkipVerify: true
+    secureJsonData:
+      password: chpwd

@@ -1,0 +1,52 @@
+version: 1
+policy:
+  pit_only: true
+  forbid_freeform_numbers: true
+  allowed_assets:
+    base:
+    - SOL
+    - mSOL
+    - jitoSOL
+    - bSOL
+    - BTC
+    - ETH
+    - USDC
+    - USDT
+  allowed_venues:
+  - Jupiter
+  - Phoenix
+  - Drift
+  - Marginfi
+  - Solend
+  - Orca
+  - Raydium
+  - Meteora
+floors:
+  hf:
+    default: 1.5
+    auto_loop: 1.6
+    emergency: 1.3
+  max_spread_bps: 50
+  min_liquidity_usd: 100000
+  oracle_delta_bps_max: 100
+  oracle_staleness_ms_max: 10000
+  max_priority_fee_microlamports_per_cu: 1500
+compatibility:
+  lp_base_to_perp:
+    SOL:
+    - SOL-PERP
+    BTC:
+    - BTC-PERP
+    ETH:
+    - ETH-PERP
+allowlists:
+  venues:
+    default:
+    - Jupiter
+    - Phoenix
+    - Drift
+    - Marginfi
+    - Solend
+    - Orca
+    - Raydium
+    - Meteora

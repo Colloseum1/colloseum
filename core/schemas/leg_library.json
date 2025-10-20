@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "legs": [
+    {
+      "key": "swap_route",
+      "inputs": {
+        "from": "mint",
+        "to": "mint",
+        "amount": "decimal",
+        "slippage_bps_max": "int"
+      },
+      "pre_checks": [
+        "min_liquidity",
+        "max_spread",
+        "venue_allow"
+      ],
+      "program_id": "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB",
+      "venue": "Jupiter",
+      "description": "Swap tokens via Jupiter aggregator with slippage protection"
+    },
+    {
+      "key": "stake",
+      "inputs": {
+        "asset_in": "SOL",
+        "lst_out": "mSOL|jitoSOL|bSOL",
+        "amount": "decimal"
+      },
+      "pre_checks": [
+        "oracle_fresh",
+        "peg_ok",
+        "venue_allow"
+      ],
+      "venue": "Marinade",
+      "description": "Stake SOL for liquid staking token (LST)"
+    },
+    {
+      "key": "hedge_perp",
+      "inputs": {
+        "symbol": "string",
+        "side": "long|short",
+        "size": "base_qty"
+      },
+      "pre_checks": [
+        "funding_ceiling",
+        "max_spread",
+        "oracle_fresh"
+      ],
+      "program_id": "dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH",
+      "venue": "Drift",
+      "description": "Open perpetual hedge position on Drift"
+    },
+    {
+      "key": "lend",
+      "inputs": {
+        "asset": "mint",
+        "amount": "decimal"
+      },
+      "pre_checks": [
+        "utilization_ok",
+        "oracle_fresh",
+        "venue_allow"
+      ],
+      "program_id": "MFv2hWf31Z9kbCa1snEPYctwafyhdvnV7FZnsebVacA",
+      "venue": "Marginfi",
+      "description": "Lend assets to Marginfi money market"
+    },
+    {
+      "key": "provide_liquidity",
+      "inputs": {
+        "pool_id": "pubkey",
+        "token_a_amount": "decimal",
+        "token_b_amount": "decimal"
+      },
+      "pre_checks": [
+        "min_liquidity",
+        "oracle_fresh",
+        "venue_allow"
+      ],
+      "program_id": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+      "venue": "Orca",
+      "description": "Provide liquidity to Orca CLMM pool"
+    }
+  ]
+}

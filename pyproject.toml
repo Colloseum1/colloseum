@@ -1,0 +1,58 @@
+[project]
+name = "colloseum"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "agno>=2.0.0",
+    "aiohttp>=3.13.0",
+    "anthropic>=0.71.0",
+    "apscheduler>=3.11.0",
+    "black>=25.9.0",
+    "blake3>=1.0.7",
+    "fastapi>=0.119.0",
+    "httpx>=0.27.0",
+    "hypothesis>=6.142.1",
+    "lancedb>=0.25.2",
+    "openai>=2.5.0",
+    "openinference-instrumentation-agno>=0.1.18",
+    "opentelemetry-api>=1.38.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.38.0",
+    "opentelemetry-instrumentation>=0.59b0",
+    "opentelemetry-sdk>=1.38.0",
+    "pandas>=2.3.3",
+    "prometheus-client>=0.21.0",
+    "psycopg[binary]>=3.0",
+    "pydantic>=2.0.0",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+    "pytest-factoryboy>=2.8.1",
+    "python-dotenv>=1.1.1",
+    "redis>=6.4.0",
+    "requests>=2.32.5",
+    "respx>=0.22.0",
+    "ruff>=0.14.1",
+    "solana>=0.36.9",
+    "solders>=0.26.0",
+    "sqlalchemy>=2.0.44",
+    "tantivy>=0.25.0",
+    "uvicorn[standard]>=0.38.0",
+    "websockets>=15.0.1",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests (require external services)",
+    "unit: marks tests as unit tests (fast, isolated)",
+]
+testpaths = ["tests", "core"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--asyncio-mode=auto",
+]
